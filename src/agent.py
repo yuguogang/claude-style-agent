@@ -25,7 +25,11 @@ def call_llm(prompt):
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 def main():
-    with open("prompt.txt") as f:
+    # Resolve path relative to this script
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prompt_path = os.path.join(base_dir, "prompts", "system.md")
+    
+    with open(prompt_path) as f:
         system_prompt = f.read()
 
     goal = input("Enter your task: ")
