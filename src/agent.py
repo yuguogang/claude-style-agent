@@ -1,206 +1,238 @@
 import os
-import json
-import requests
 import time
+import json
 import random
+import requests
 from requests.exceptions import HTTPError, RequestException
-
 from dotenv import load_dotenv
 
 from state_store import init_db, load_state, save_state, clear_state
 from tools import run_tool
 
+# --- Configuration ---
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = "gemini-2.5-flash"
 API_URL = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={API_KEY}"
 
 PHASE_ORDER = ["plan", "act", "reflect"]
+MAX_RETRIES = 6
+BASE_SLEEP = 1.0
+MAX_SLEEP = 30.0
+MIN_REQUEST_INTERVAL = 1.2  # Seconds between requests to avoid 429
 
-def call_llm(prompt: str, max_retries: int = 6) -> str:
+# --- Helper Functions ---
+
+def generate_content(prompt: str) -> str:
+    """
+    Calls the Gemini API with exponential backoff for rate limits.
+    """
     payload = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}]
-            }
-        ]
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
     }
 
-    # 基础退避参数
-    base_sleep = 1.0  # seconds
-    max_sleep = 30.0  # cap
-
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.post(API_URL, json=payload, timeout=60)
+            response = requests.post(API_URL, json=payload, timeout=60)
 
-            # 对 429/5xx 做重试，其余 raise
-            if r.status_code == 429 or (500 <= r.status_code < 600):
-                retry_after = r.headers.get("Retry-After")
+            # Handle Rate Limiting (429) and Server Errors (5xx)
+            if response.status_code == 429 or (500 <= response.status_code < 600):
+                retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     try:
-                        sleep_s = float(retry_after)
+                        sleep_time = float(retry_after)
                     except ValueError:
-                        sleep_s = base_sleep
+                        sleep_time = BASE_SLEEP
                 else:
-                    # 指数退避 + 抖动
-                    sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
-                    sleep_s = sleep_s * (0.7 + random.random() * 0.6)  # jitter 0.7~1.3
+                    # Exponential backoff + Jitter
+                    sleep_time = min(MAX_SLEEP, BASE_SLEEP * (2 ** (attempt - 1)))
+                    sleep_time = sleep_time * (0.7 + random.random() * 0.6)
 
-                print(f"[WARN] HTTP {r.status_code} (attempt {attempt}/{max_retries}). Sleeping {sleep_s:.1f}s then retry...")
-                time.sleep(sleep_s)
+                print(f"[WARN] HTTP {response.status_code} (attempt {attempt}/{MAX_RETRIES}). Sleeping {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
                 continue
 
-            r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            response.raise_for_status()
+            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
 
-        except HTTPError as e:
-            # 非 429/5xx 的 HTTP 错误通常是参数/权限问题，不要重试
+        except HTTPError:
+            # Client errors (4xx except 429) should raise immediately
             raise
         except RequestException as e:
-            # 网络抖动等：也退避重试
-            sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
-            sleep_s = sleep_s * (0.7 + random.random() * 0.6)
-            print(f"[WARN] Network error (attempt {attempt}/{max_retries}): {e}. Sleeping {sleep_s:.1f}s...")
-            time.sleep(sleep_s)
+            # Network errors: retry
+            sleep_time = min(MAX_SLEEP, BASE_SLEEP * (2 ** (attempt - 1)))
+            print(f"[WARN] Network error (attempt {attempt}/{MAX_RETRIES}): {e}. Sleeping {sleep_time:.1f}s...")
+            time.sleep(sleep_time)
 
-    raise RuntimeError("LLM request failed after retries (rate limit or network).")
+    raise RuntimeError("LLM request failed after max retries.")
 
-
-def extract_json(text: str) -> dict:
+def parse_response(text: str) -> dict:
     """
-    Robustly parse JSON from model output, tolerating markdown fences or extra text.
+    Parses JSON from LLM output, handling potential Markdown fencing.
     """
-    t = text.strip()
+    clean_text = text.strip()
 
-    # Remove ```json ... ``` fences if present
-    if t.startswith("```"):
-        # remove first fence line
-        lines = t.splitlines()
-        if lines:
+    # Remove Markdown code blocks only if they exist
+    if clean_text.startswith("```"):
+        # Split into lines to remove first and last line (the fences)
+        lines = clean_text.splitlines()
+        # Remove header fence (e.g., ```json)
+        if lines: 
             lines = lines[1:]
-        # remove last fence if present
-        if lines and lines[-1].strip().startswith("```"):
+        # Remove footer fence (```)
+        if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
-        t = "\n".join(lines).strip()
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-
-    # Direct parse
+        clean_text = "\n".join(lines).strip()
+    
+    # Attempt direct extraction
     try:
-        return json.loads(t)
+        return json.loads(clean_text)
     except json.JSONDecodeError:
         pass
 
-    # Fallback: take substring from first { to last }
-    start = t.find("{")
-    end = t.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(t[start:end+1])
+    # Fallback: Extract from first '{' to last '}'
+    start_idx = clean_text.find("{")
+    end_idx = clean_text.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        return json.loads(clean_text[start_idx:end_idx+1])
 
     raise ValueError("No valid JSON found in model output")
 
-def next_phase(current: str) -> str:
+def get_next_phase(current_phase: str) -> str:
     try:
-        i = PHASE_ORDER.index(current)
+        idx = PHASE_ORDER.index(current_phase)
+        return PHASE_ORDER[(idx + 1) % len(PHASE_ORDER)]
     except ValueError:
-        return "plan"
-    return PHASE_ORDER[(i + 1) % len(PHASE_ORDER)]
+        return PHASE_ORDER[0]
 
-def main():
-    # project root path resolve
+def load_system_prompt() -> str:
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     prompt_path = os.path.join(base_dir, "prompts", "system.md")
-
     with open(prompt_path, "r", encoding="utf-8") as f:
-        system_prompt = f.read()
+        return f.read()
 
+def initialize_state() -> dict:
     init_db()
-
     state = load_state()
+    
     if state:
-        ans = input("🔁 Resume previous task? (Y/n): ").strip().lower()
-        if ans == "n":
+        print("🔁 Current State Found:")
+        print(json.dumps(state, indent=2, ensure_ascii=False))
+        choice = input("Resume previous task? (Y/n): ").strip().lower()
+        if choice == "n":
             clear_state()
             state = None
-
+    
     if not state:
-        goal = input("Enter your task: ")
+        task = input("Enter your task: ")
         state = {
-            "goal": goal,
+            "goal": task,
             "constraints": ["Practical", "Step-by-step"],
             "progress": [],
             "current_phase": "plan",
-            "next_step": ""
+            "next_step": "",
+            "observation": None # Explicitly None for clarity
         }
         save_state(state)
-    last_call_ts = 0.0
-    min_interval_s = 1.2
-    while True:
-        full_prompt = system_prompt + "\n\nSTATE:\n" + json.dumps(state, ensure_ascii=False, indent=2)
-
-        now = time.time()
-        wait = min_interval_s - (now - last_call_ts)
-        if wait > 0:
-            time.sleep(wait)
-        last_call_ts = time.time()
-        response_text = call_llm(full_prompt)
-        print("\nLLM RAW OUTPUT:\n", response_text)
-
-        if response_text.strip().startswith("{") or response_text.strip().startswith("```"):
-             # Optional: Try to pretty print if it looks like JSON
-             pass # We print raw output above already
         
-        response = extract_json(response_text)
+    return state
 
-        # ---- Tool calling: only when model asks for it
-        tool_req = response.get("tool")
-        if tool_req:
-            try:
-                tool_result = run_tool(tool_req)
-                state["observation"] = {
-                    "tool": tool_req.get("name"),
-                    "args": tool_req.get("args", {}),
-                    "result": tool_result,
-                }
-                # 关键：工具执行后不强制前进 phase，让模型下一轮在 REFLECT/PLAN 消化 observation
-                save_state(state)
-                print("\n🔧 TOOL RESULT:\n", json.dumps(state["observation"], ensure_ascii=False, indent=2))
-            except Exception as e:
-                state["observation"] = {
-                    "tool": tool_req.get("name"),
-                    "error": str(e),
-                }
-                save_state(state)
-                print("\n❌ TOOL ERROR:\n", json.dumps(state["observation"], ensure_ascii=False, indent=2))
+# --- Main Logic ---
 
+def main():
+    system_prompt = load_system_prompt()
+    state = initialize_state()
+    
+    last_request_time = 0.0
+
+    while True:
+        # Rate limiting logic
+        time_since_last = time.time() - last_request_time
+        if time_since_last < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - time_since_last)
+            
+        # Construct Prompt
+        full_prompt = f"{system_prompt}\n\nSTATE:\n{json.dumps(state, ensure_ascii=False, indent=2)}"
+        
+        # Call LLM
+        raw_response = generate_content(full_prompt)
+        last_request_time = time.time()
+        
+        print("\n🤖 LLM RESPONSE:\n", raw_response)
+        
+        try:
+            parsed_response = parse_response(raw_response)
+        except ValueError as e:
+            print(f"❌ JSON Parsing Failed: {e}")
+            continue
+
+        # Handle Tool Calls
+        tool_call = parsed_response.get("tool")
+        if tool_call:
+            handle_tool_call(state, tool_call)
             input("\nPress Enter to continue...\n")
             continue
 
-        # ---- Normal response path
-        llm_state = response.get("state", {})
-        decision = response.get("decision", "continue")
-        output = response.get("output", "")
-
-        print("\nOUTPUT:\n", output)
-
-        # 合并 state（保留必要字段），并收回 phase 控制权
-        # 你也可以改成更严格的 schema 校验
-        for k in ["goal", "constraints", "progress", "next_step", "observation", "current_phase"]:
-            if k in llm_state:
-                state[k] = llm_state[k]
-
-        # phase 由程序推进（防止模型劫持）
-        state["current_phase"] = next_phase(state.get("current_phase", "plan"))
-
-        save_state(state)
-
-        if decision == "done":
+        # Handle Normal Agent Step
+        handle_agent_step(state, parsed_response)
+        
+        # Check Completion
+        if parsed_response.get("decision") == "done":
             print("\n✅ Task completed.")
             clear_state()
             break
 
         input("\nPress Enter to continue...\n")
+
+
+def handle_tool_call(state: dict, tool_call: dict):
+    tool_name = tool_call.get("name")
+    tool_args = tool_call.get("args", {})
+    
+    print(f"\n�  Executing Tool: {tool_name} {tool_args}")
+    
+    try:
+        result = run_tool(tool_call)
+        state["observation"] = {
+            "tool": tool_name,
+            "args": tool_args,
+            "result": result
+        }
+        print("\n✅ Tool Output:", json.dumps(result, ensure_ascii=False, indent=2))
+        
+    except Exception as e:
+        state["observation"] = {
+            "tool": tool_name,
+            "error": str(e)
+        }
+        print(f"\n❌ Tool Error: {e}")
+
+    save_state(state)
+
+
+def handle_agent_step(state: dict, response: dict):
+    # Update state fields from LLM response
+    llm_state = response.get("state", {})
+    keys_to_update = ["goal", "constraints", "progress", "next_step", "observation"]
+    
+    for key in keys_to_update:
+        if key in llm_state:
+            state[key] = llm_state[key]
+
+    # Display Output
+    output_message = response.get("output", "")
+    if output_message:
+        print("\n📝 Agent Output:\n", output_message)
+
+    # Progression Logic
+    # We ignore the LLM's 'current_phase' and enforce our own rotation
+    current_phase = state.get("current_phase", "plan")
+    state["current_phase"] = get_next_phase(current_phase)
+    
+    save_state(state)
+
 
 if __name__ == "__main__":
     main()
