@@ -12,6 +12,7 @@ STATE must include:
 - constraints
 - progress
 - current_phase (plan | act | reflect)
+- observation (optional)
 - next_step
 
 Rules:
@@ -30,3 +31,19 @@ Output format MUST be valid JSON:
 }
 
 Do not include any text outside JSON.
+
+When current_phase is "act", you MAY request a tool call.
+
+If you request a tool call, include a "tool" field:
+"tool": { "name": "...", "args": { ... } }
+
+Allowed tools:
+- shell: { "cmd": "..." }
+- read_file: { "path": "..." }
+- write_file: { "path": "...", "content": "..." }
+
+If you include "tool", your "output" should briefly explain why you need it.
+After the tool runs, you will receive an observation in STATE.observation.
+Then proceed to the next phase.
+
+Still output ONLY valid JSON.
